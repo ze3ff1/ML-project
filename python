@@ -1,0 +1,248 @@
+"""Минимальный RAG-чат по локальным документам.
+
+Текст документов и эмбеддинги хранятся только в памяти запущенного процесса.
+API-ключ вводится в интерфейсе или передаётся как OPENAI_API_KEY.
+"""
+
+from __future__ import annotations
+
+import io
+import math
+import os
+from dataclasses import dataclass
+
+import streamlit as st
+from docx import Document
+from openai import OpenAI
+from pypdf import PdfReader
+
+
+EMBEDDING_MODEL = "text-embedding-3-small"
+DEFAULT_CHAT_MODEL = "gpt-5.4-mini"
+CHUNK_SIZE = 1_200
+CHUNK_OVERLAP = 180
+
+
+@dataclass
+class Chunk:
+    text: str
+    source: str
+    location: str
+    embedding: list[float] | None = None
+
+    @property
+    def citation(self) -> str:
+        return f"{self.source} — {self.location}"
+
+
+def get_api_key() -> str:
+    return st.session_state.get("api_key") or os.environ.get("OPENAI_API_KEY", "")
+
+
+def extract_pages(uploaded_file) -> list[tuple[str, str]]:
+    """Returns (location, text) pairs, retaining PDF page provenance."""
+    suffix = uploaded_file.name.rsplit(".", 1)[-1].lower()
+    raw = uploaded_file.getvalue()
+
+    if suffix == "pdf":
+        reader = PdfReader(io.BytesIO(raw))
+        return [(f"стр. {i + 1}", page.extract_text() or "") for i, page in enumerate(reader.pages)]
+    if suffix == "docx":
+        document = Document(io.BytesIO(raw))
+        return [("документ", "\n".join(p.text for p in document.paragraphs))]
+    if suffix in {"txt", "md"}:
+        return [("документ", raw.decode("utf-8", errors="replace"))]
+    raise ValueError(f"Формат .{suffix} пока не поддерживается")
+
+
+def split_text(text: str) -> list[str]:
+    """Chunks text by paragraphs where possible, keeping a small overlap."""
+    clean = "\n".join(line.strip() for line in text.splitlines() if line.strip())
+    if not clean:
+        return []
+
+    chunks: list[str] = []
+    start = 0
+    while start < len(clean):
+        end = min(start + CHUNK_SIZE, len(clean))
+        if end < len(clean):
+            boundary = max(clean.rfind("\n", start, end), clean.rfind(". ", start, end))
+            if boundary > start + CHUNK_SIZE // 2:
+                end = boundary + 1
+        piece = clean[start:end].strip()
+        if piece:
+            chunks.append(piece)
+        if end >= len(clean):
+            break
+        start = max(end - CHUNK_OVERLAP, start + 1)
+    return chunks
+
+
+def make_chunks(files) -> list[Chunk]:
+    chunks: list[Chunk] = []
+    for file in files:
+        for location, text in extract_pages(file):
+            chunks.extend(Chunk(part, file.name, location) for part in split_text(text))
+    return chunks
+
+
+def embed_chunks(client: OpenAI, chunks: list[Chunk]) -> None:
+    """Embed in batches so a large collection does not create one request per chunk."""
+    for offset in range(0, len(chunks), 50):
+        batch = chunks[offset : offset + 50]
+        result = client.embeddings.create(model=EMBEDDING_MODEL, input=[c.text for c in batch])
+        for chunk, item in zip(batch, result.data):
+            chunk.embedding = item.embedding
+
+
+def cosine(left: list[float], right: list[float]) -> float:
+    dot = sum(a * b for a, b in zip(left, right))
+    left_len = math.sqrt(sum(a * a for a in left))
+    right_len = math.sqrt(sum(b * b for b in right))
+    return dot / (left_len * right_len) if left_len and right_len else 0.0
+
+
+def retrieve(client: OpenAI, question: str, chunks: list[Chunk], count: int = 5) -> list[Chunk]:
+    result = client.embeddings.create(model=EMBEDDING_MODEL, input=question)
+    query = result.data[0].embedding
+    ranked = sorted(chunks, key=lambda c: cosine(query, c.embedding or []), reverse=True)
+    return ranked[:count]
+
+
+def answer_question(client: OpenAI, model: str, question: str, context: list[Chunk]) -> str:
+    passages = "\n\n".join(
+        f"[{i + 1}] Источник: {chunk.citation}\n{chunk.text}"
+        for i, chunk in enumerate(context)
+    )
+    prompt = f"""Ты отвечаешь только на основе приведённых фрагментов документов.
+Если в них нет ответа, так и скажи. Не придумывай факты. Отвечай по-русски,
+кратко и ясно. После каждого важного утверждения ставь ссылку в формате [1], [2].
+
+ФРАГМЕНТЫ:
+{passages}
+
+ВОПРОС: {question}"""
+    response = client.responses.create(model=model, input=prompt, store=False)
+    return response.output_text
+
+
+def reset_collection() -> None:
+    st.session_state.chunks = []
+    st.session_state.chat = []
+
+
+st.set_page_config(page_title="Документы · RAG", page_icon="📚", layout="wide")
+st.title("📚 Чат с документами")
+st.caption("Загрузите документы, затем задавайте вопросы. В ответе будут указаны найденные источники.")
+
+if "chunks" not in st.session_state:
+    reset_collection()
+
+with st.sidebar:
+    st.header("Настройки")
+    st.text_input("OpenAI API key", type="password", key="api_key", help="Ключ используется только в памяти текущей сессии.")
+    model = st.text_input("Модель для ответа", value=DEFAULT_CHAT_MODEL)
+    uploads = st.file_uploader("Документы", type=["pdf", "docx", "txt", "md"], accept_multiple_files=True)
+    if st.button("Индексировать документы", type="primary", use_container_width=True):
+        if not uploads:
+            st.warning("Сначала выберите хотя бы один документ.")
+        elif not get_api_key():
+            st.warning("Введите OpenAI API key.")
+        else:
+            try:
+                with st.spinner("Извлекаю текст и создаю векторный индекс…"):
+                    collection = make_chunks(uploads)
+                    if not collection:
+                        raise ValueError("В документах не найден извлекаемый текст.")
+                    embed_chunks(OpenAI(api_key=get_api_key()), collection)
+                    st.session_state.chunks = collection
+                    st.session_state.chat = []
+                st.success(f"Готово: {len(collection)} фрагм. из {len(uploads)} файл(ов).")
+            except Exception as error:
+                st.error(f"Не удалось индексировать: {error}")
+    if st.button("Очистить сессию", use_container_width=True):
+        reset_collection()
+        st.rerun()
+
+if st.session_state.chunks:
+    st.info(f"В индексе: {len(st.session_state.chunks)} фрагментов. Документы не сохраняются на диск.")
+else:
+    st.info("Загрузите и индексируйте документы в боковой панели.")
+
+for message in st.session_state.chat:
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
+
+question = st.chat_input("Например: Какие сроки указаны в договоре?")
+if question:
+    st.session_state.chat.append({"role": "user", "content": question})
+    with st.chat_message("user"):
+        st.markdown(question)
+    with st.chat_message("assistant"):
+        if not st.session_state.chunks:
+            reply = "Сначала загрузите и индексируйте документы."
+            st.warning(reply)
+        elif not get_api_key():
+            reply = "Введите OpenAI API key в боковой панели."
+            st.warning(reply)
+        else:
+            try:
+                with st.spinner("Ищу подходящие фрагменты и готовлю ответ…"):
+                    client = OpenAI(api_key=get_api_key())
+                    found = retrieve(client, question, st.session_state.chunks)
+                    reply = answer_question(client, model, question, found)
+                st.markdown(reply)
+                with st.expander("Фрагменты, использованные для ответа"):
+                    for index, chunk in enumerate(found, start=1):
+                        st.markdown(f"**[{index}] {chunk.citation}**")
+                        st.caption(chunk.text[:700] + ("…" if len(chunk.text) > 700 else ""))
+            except Exception as error:
+                reply = f"Ошибка при формировании ответа: {error}"
+                st.error(reply)
+    st.session_state.chat.append({"role": "assistant", "content": reply})
+
+# Чат с документами — RAG MVP
+
+Небольшой веб-интерфейс на Streamlit: загружает PDF, DOCX, TXT и Markdown,
+разбивает текст на фрагменты, строит для них векторный индекс и отвечает на
+вопросы только с опорой на найденный контекст.
+
+## Запуск на Windows
+
+```powershell
+cd "C:\Users\zeeff\Documents\Codex\2026-09-06\new-chat\outputs\document-rag-chat"
+py -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+$env:OPENAI_API_KEY = "ваш_ключ"
+streamlit run app.py
+```
+
+Либо введите ключ прямо в боковой панели после запуска. Он не записывается в
+файлы и живёт только в памяти текущей сессии.
+
+## Как устроено
+
+1. Из PDF сохраняется номер страницы; из DOCX/TXT/MD — документ целиком.
+2. Текст делится на перекрывающиеся фрагменты по ~1200 символов.
+3. Фрагменты и вопрос превращаются в эмбеддинги `text-embedding-3-small`.
+4. По косинусной близости выбираются 5 подходящих фрагментов.
+5. Вопрос и эти фрагменты отправляются в Responses API. В ответе модель обязана
+   приводить ссылки вида `[1]`; ниже раскрывается сам набор использованных фрагментов.
+
+По умолчанию стоит `gpt-5.4-mini`; поле модели можно поменять на доступную в
+вашем API-модели. Модель ответов и эмбеддинги требуют оплачиваемого OpenAI API.
+
+## Ограничения MVP
+
+- Индекс и переписка не переживают перезапуск приложения.
+- Сканированные PDF без текстового слоя потребуют OCR.
+- В продакшене стоит вынести ключ на сервер, добавить авторизацию, постоянное
+  векторное хранилище, фоновые задачи, лимиты файлов и тесты качества ответов.
+
+## Пример вопроса
+
+После загрузки договора: `Какие сроки оплаты указаны в документе?`
+
+# Не добавляйте реальный ключ в Git.
+OPENAI_API_KEY=sk-your-key-here
